@@ -17,7 +17,6 @@ package raft
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"strings"
@@ -43,7 +42,7 @@ func diffu(a, b string) string {
 }
 
 func mustTemp(pre, body string) string {
-	f, err := ioutil.TempFile("", pre)
+	f, err := os.CreateTemp("", pre)
 	if err != nil {
 		panic(err)
 	}
@@ -56,8 +55,9 @@ func mustTemp(pre, body string) string {
 }
 
 func ltoa(l *raftLog) string {
-	s := fmt.Sprintf("committed: %d\n", l.committed)
+	s := fmt.Sprintf("lastIndex: %d\n", l.lastIndex())
 	s += fmt.Sprintf("applied:  %d\n", l.applied)
+	s += fmt.Sprintf("applying:  %d\n", l.applying)
 	for i, e := range l.allEntries() {
 		s += fmt.Sprintf("#%d: %+v\n", i, e)
 	}

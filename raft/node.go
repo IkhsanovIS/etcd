@@ -57,7 +57,12 @@ type Ready struct {
 
 	// The current state of a Node to be saved to stable storage BEFORE
 	// Messages are sent.
+	//
 	// HardState will be equal to empty state if there is no update.
+	//
+	// If async storage writes are enabled, this field does not need to be acted
+	// on immediately. It will be reflected in a MsgStorageAppend message in the
+	// Messages slice.
 	pb.HardState
 
 	// ReadStates can be used for node to serve linearizable read requests locally
@@ -68,24 +73,44 @@ type Ready struct {
 
 	// Entries specifies entries to be saved to stable storage BEFORE
 	// Messages are sent.
+	//
+	// If async storage writes are enabled, this field does not need to be acted
+	// on immediately. It will be reflected in a MsgStorageAppend message in the
+	// Messages slice.
 	Entries []pb.Entry
 
 	// Snapshot specifies the snapshot to be saved to stable storage.
+	//
+	// If async storage writes are enabled, this field does not need to be acted
+	// on immediately. It will be reflected in a MsgStorageAppend message in the
+	// Messages slice.
 	Snapshot pb.Snapshot
 
 	// CommittedEntries specifies entries to be committed to a
-	// store/state-machine. These have previously been committed to stable
-	// store.
+	// store/state-machine. These have previously been appended to stable
+	// storage.
+	//
+	// If async storage writes are enabled, this field does not need to be acted
+	// on immediately. It will be reflected in a MsgStorageApply message in the
+	// Messages slice.
 	CommittedEntries []pb.Entry
 
-	// Messages specifies outbound messages to be sent AFTER Entries are
-	// committed to stable storage.
+	// Messages specifies outbound messages.
+	//
+	// If async storage writes are not enabled, these messages must be sent
+	// AFTER Entries are appended to stable storage.
+	//
+	// If async storage writes are enabled, these messages can be sent
+	// immediately as the messages that have the completion of the async writes
+	// as a precondition are attached to the individual MsgStorage{Append,Apply}
+	// messages instead.
+	//
 	// If it contains a MsgSnap message, the application MUST report back to raft
 	// when the snapshot has been received or has failed by calling ReportSnapshot.
 	Messages []pb.Message
 
-	// MustSync indicates whether the HardState and Entries must be synchronously
-	// written to disk or if an asynchronous write is permissible.
+	// MustSync indicates whether the HardState and Entries must be durably
+	// written to disk or if a non-durable write is permissible.
 	MustSync bool
 }
 
@@ -101,25 +126,6 @@ func IsEmptyHardState(st pb.HardState) bool {
 // IsEmptySnap returns true if the given Snapshot is empty.
 func IsEmptySnap(sp pb.Snapshot) bool {
 	return sp.Metadata.Index == 0
-}
-
-func (rd Ready) containsUpdates() bool {
-	return rd.SoftState != nil || !IsEmptyHardState(rd.HardState) ||
-		!IsEmptySnap(rd.Snapshot) || len(rd.Entries) > 0 ||
-		len(rd.CommittedEntries) > 0 || len(rd.Messages) > 0 || len(rd.ReadStates) != 0
-}
-
-// appliedCursor extracts from the Ready the highest index the client has
-// applied (once the Ready is confirmed via Advance). If no information is
-// contained in the Ready, returns zero.
-func (rd Ready) appliedCursor() uint64 {
-	if n := len(rd.CommittedEntries); n > 0 {
-		return rd.CommittedEntries[n-1].Index
-	}
-	if index := rd.Snapshot.Metadata.Index; index > 0 {
-		return index
-	}
-	return 0
 }
 
 // Node represents a node in a raft cluster.
@@ -150,7 +156,8 @@ type Node interface {
 	Step(ctx context.Context, msg pb.Message) error
 
 	// Ready returns a channel that returns the current point-in-time state.
-	// Users of the Node must call Advance after retrieving the state returned by Ready.
+	// Users of the Node must call Advance after retrieving the state returned by Ready (unless
+	// async storage writes is enabled, in which case it should never be called).
 	//
 	// NOTE: No committed entries from the next Ready may be applied until all committed entries
 	// and snapshots from the previous one have finished.
@@ -165,6 +172,9 @@ type Node interface {
 	// commands. For example. when the last Ready contains a snapshot, the application might take
 	// a long time to apply the snapshot data. To continue receiving Ready without blocking raft
 	// progress, it can call Advance before finishing applying the last ready.
+	//
+	// NOTE: Advance must not be called when using AsyncStorageWrites. Response messages from the
+	// local append and apply threads take its place.
 	Advance()
 	// ApplyConfChange applies a config change (previously passed to
 	// ProposeConfChange) to the node. This must be called whenever a config
@@ -178,6 +188,32 @@ type Node interface {
 
 	// TransferLeadership attempts to transfer leadership to the given transferee.
 	TransferLeadership(ctx context.Context, lead, transferee uint64)
+
+	// ForgetLeader forgets a follower's current leader, changing it to None. It
+	// remains a leaderless follower in the current term, without campaigning.
+	//
+	// This is useful with PreVote+CheckQuorum, where followers will normally not
+	// grant pre-votes if they've heard from the leader in the past election
+	// timeout interval. Leaderless followers can grant pre-votes immediately, so
+	// if a quorum of followers have strong reason to believe the leader is dead
+	// (for example via a side-channel or external failure detector) and forget it
+	// then they can elect a new leader immediately, without waiting out the
+	// election timeout. They will also revert to normal followers if they hear
+	// from the leader again, or transition to candidates on an election timeout.
+	//
+	// For example, consider a three-node cluster where 1 is the leader and 2+3
+	// have just received a heartbeat from it. If 2 and 3 believe the leader has
+	// now died (maybe they know that an orchestration system shut down 1's VM),
+	// we can instruct 2 to forget the leader and 3 to campaign. 2 will then be
+	// able to grant 3's pre-vote and elect 3 as leader immediately (normally 2
+	// would reject the vote until an election timeout passes because it has heard
+	// from the leader recently). However, 3 can not campaign unilaterally, a
+	// quorum have to agree that the leader is dead, which avoids disrupting the
+	// leader if individual nodes are wrong about it being dead.
+	//
+	// This does nothing with ReadOnlyLeaseBased, since it would allow a new
+	// leader to be elected without the old leader knowing.
+	ForgetLeader(ctx context.Context) error
 
 	// ReadIndex request a read state. The read state will be set in the ready.
 	// Read state has a read index. Once the application advances further than the read
@@ -211,11 +247,7 @@ type Peer struct {
 	Context []byte
 }
 
-// StartNode returns a new Node given configuration and a list of raft peers.
-// It appends a ConfChangeAddNode entry for each given peer to the initial log.
-//
-// Peers must not be zero length; call RestartNode in that case.
-func StartNode(c *Config, peers []Peer) Node {
+func setupNode(c *Config, peers []Peer) *node {
 	if len(peers) == 0 {
 		panic("no peers given; use RestartNode instead")
 	}
@@ -223,12 +255,23 @@ func StartNode(c *Config, peers []Peer) Node {
 	if err != nil {
 		panic(err)
 	}
-	rn.Bootstrap(peers)
+	err = rn.Bootstrap(peers)
+	if err != nil {
+		c.Logger.Warningf("error occurred during starting a new node: %v", err)
+	}
 
 	n := newNode(rn)
-
-	go n.run()
 	return &n
+}
+
+// StartNode returns a new Node given configuration and a list of raft peers.
+// It appends a ConfChangeAddNode entry for each given peer to the initial log.
+//
+// Peers must not be zero length; call RestartNode in that case.
+func StartNode(c *Config, peers []Peer) Node {
+	n := setupNode(c, peers)
+	go n.run()
+	return n
 }
 
 // RestartNode is similar to StartNode but does not take a list of peers.
@@ -308,9 +351,7 @@ func (n *node) run() {
 	lead := None
 
 	for {
-		if advancec != nil {
-			readyc = nil
-		} else if n.rn.HasReady() {
+		if advancec == nil && n.rn.HasReady() {
 			// Populate a Ready. Note that this Ready is not guaranteed to
 			// actually be handled. We will arm readyc, but there's no guarantee
 			// that we will actually send on it. It's possible that we will
@@ -351,10 +392,11 @@ func (n *node) run() {
 				close(pm.result)
 			}
 		case m := <-n.recvc:
-			// filter out response message from unknown From.
-			if pr := r.prs.Progress[m.From]; pr != nil || !IsResponseMsg(m.Type) {
-				r.Step(m)
+			if IsResponseMsg(m.Type) && !IsLocalMsgTarget(m.From) && r.prs.Progress[m.From] == nil {
+				// Filter out response message from unknown From.
+				break
 			}
+			r.Step(m)
 		case cc := <-n.confc:
 			_, okBefore := r.prs.Progress[r.id]
 			cs := r.applyConfChange(cc)
@@ -369,13 +411,15 @@ func (n *node) run() {
 			// very sound and likely has bugs.
 			if _, okAfter := r.prs.Progress[r.id]; okBefore && !okAfter {
 				var found bool
-			outer:
 				for _, sl := range [][]uint64{cs.Voters, cs.VotersOutgoing} {
 					for _, id := range sl {
 						if id == r.id {
 							found = true
-							break outer
+							break
 						}
+					}
+					if found {
+						break
 					}
 				}
 				if !found {
@@ -390,7 +434,12 @@ func (n *node) run() {
 			n.rn.Tick()
 		case readyc <- rd:
 			n.rn.acceptReady(rd)
-			advancec = n.advancec
+			if !n.rn.asyncStorageWrites {
+				advancec = n.advancec
+			} else {
+				rd = Ready{}
+			}
+			readyc = nil
 		case <-advancec:
 			n.rn.Advance(rd)
 			rd = Ready{}
@@ -422,8 +471,8 @@ func (n *node) Propose(ctx context.Context, data []byte) error {
 }
 
 func (n *node) Step(ctx context.Context, m pb.Message) error {
-	// ignore unexpected local messages receiving over network
-	if IsLocalMsg(m.Type) {
+	// Ignore unexpected local messages receiving over network.
+	if IsLocalMsg(m.Type) && !IsLocalMsgTarget(m.From) {
 		// TODO: return an error?
 		return nil
 	}
@@ -552,39 +601,10 @@ func (n *node) TransferLeadership(ctx context.Context, lead, transferee uint64) 
 	}
 }
 
+func (n *node) ForgetLeader(ctx context.Context) error {
+	return n.step(ctx, pb.Message{Type: pb.MsgForgetLeader})
+}
+
 func (n *node) ReadIndex(ctx context.Context, rctx []byte) error {
 	return n.step(ctx, pb.Message{Type: pb.MsgReadIndex, Entries: []pb.Entry{{Data: rctx}}})
-}
-
-func newReady(r *raft, prevSoftSt *SoftState, prevHardSt pb.HardState) Ready {
-	rd := Ready{
-		Entries:          r.raftLog.unstableEntries(),
-		CommittedEntries: r.raftLog.nextEnts(),
-		Messages:         r.msgs,
-	}
-	if softSt := r.softState(); !softSt.equal(prevSoftSt) {
-		rd.SoftState = softSt
-	}
-	if hardSt := r.hardState(); !isHardStateEqual(hardSt, prevHardSt) {
-		rd.HardState = hardSt
-	}
-	if r.raftLog.unstable.snapshot != nil {
-		rd.Snapshot = *r.raftLog.unstable.snapshot
-	}
-	if len(r.readStates) != 0 {
-		rd.ReadStates = r.readStates
-	}
-	rd.MustSync = MustSync(r.hardState(), prevHardSt, len(rd.Entries))
-	return rd
-}
-
-// MustSync returns true if the hard state and count of Raft entries indicate
-// that a synchronous write to persistent storage is required.
-func MustSync(st, prevst pb.HardState, entsnum int) bool {
-	// Persistent state on all servers:
-	// (Updated on stable storage before responding to RPCs)
-	// currentTerm
-	// votedFor
-	// log entries[]
-	return entsnum != 0 || st.Vote != prevst.Vote || st.Term != prevst.Term
 }

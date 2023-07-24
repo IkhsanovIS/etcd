@@ -15,10 +15,12 @@
 package raft
 
 import (
+	"fmt"
 	"math"
-	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 
 	pb "go.etcd.io/etcd/raft/v3/raftpb"
 )
@@ -34,40 +36,35 @@ func TestDescribeEntry(t *testing.T) {
 		Type:  pb.EntryNormal,
 		Data:  []byte("hello\x00world"),
 	}
-
-	defaultFormatted := DescribeEntry(entry, nil)
-	if defaultFormatted != "1/2 EntryNormal \"hello\\x00world\"" {
-		t.Errorf("unexpected default output: %s", defaultFormatted)
-	}
-
-	customFormatted := DescribeEntry(entry, testFormatter)
-	if customFormatted != "1/2 EntryNormal HELLO\x00WORLD" {
-		t.Errorf("unexpected custom output: %s", customFormatted)
-	}
+	require.Equal(t, `1/2 EntryNormal "hello\x00world"`, DescribeEntry(entry, nil))
+	require.Equal(t, "1/2 EntryNormal HELLO\x00WORLD", DescribeEntry(entry, testFormatter))
 }
 
 func TestLimitSize(t *testing.T) {
 	ents := []pb.Entry{{Index: 4, Term: 4}, {Index: 5, Term: 5}, {Index: 6, Term: 6}}
-	tests := []struct {
-		maxsize  uint64
-		wentries []pb.Entry
-	}{
-		{math.MaxUint64, []pb.Entry{{Index: 4, Term: 4}, {Index: 5, Term: 5}, {Index: 6, Term: 6}}},
-		// even if maxsize is zero, the first entry should be returned
-		{0, []pb.Entry{{Index: 4, Term: 4}}},
-		// limit to 2
-		{uint64(ents[0].Size() + ents[1].Size()), []pb.Entry{{Index: 4, Term: 4}, {Index: 5, Term: 5}}},
-		// limit to 2
-		{uint64(ents[0].Size() + ents[1].Size() + ents[2].Size()/2), []pb.Entry{{Index: 4, Term: 4}, {Index: 5, Term: 5}}},
-		{uint64(ents[0].Size() + ents[1].Size() + ents[2].Size() - 1), []pb.Entry{{Index: 4, Term: 4}, {Index: 5, Term: 5}}},
-		// all
-		{uint64(ents[0].Size() + ents[1].Size() + ents[2].Size()), []pb.Entry{{Index: 4, Term: 4}, {Index: 5, Term: 5}, {Index: 6, Term: 6}}},
+	prefix := func(size int) []pb.Entry {
+		return append([]pb.Entry{}, ents[:size]...) // protect the original slice
 	}
-
-	for i, tt := range tests {
-		if !reflect.DeepEqual(limitSize(ents, tt.maxsize), tt.wentries) {
-			t.Errorf("#%d: entries = %v, want %v", i, limitSize(ents, tt.maxsize), tt.wentries)
-		}
+	for _, tt := range []struct {
+		maxSize uint64
+		want    []pb.Entry
+	}{
+		{math.MaxUint64, prefix(len(ents))}, // all entries are returned
+		// Even if maxSize is zero, the first entry should be returned.
+		{0, prefix(1)},
+		// Limit to 2.
+		{uint64(ents[0].Size() + ents[1].Size()), prefix(2)},
+		{uint64(ents[0].Size() + ents[1].Size() + ents[2].Size()/2), prefix(2)},
+		{uint64(ents[0].Size() + ents[1].Size() + ents[2].Size() - 1), prefix(2)},
+		// All.
+		{uint64(ents[0].Size() + ents[1].Size() + ents[2].Size()), prefix(3)},
+	} {
+		t.Run("", func(t *testing.T) {
+			got := limitSize(ents, entryEncodingSize(tt.maxSize))
+			require.Equal(t, tt.want, got)
+			size := entsSize(got)
+			require.True(t, len(got) == 1 || size <= entryEncodingSize(tt.maxSize))
+		})
 	}
 }
 
@@ -95,12 +92,61 @@ func TestIsLocalMsg(t *testing.T) {
 		{pb.MsgReadIndexResp, false},
 		{pb.MsgPreVote, false},
 		{pb.MsgPreVoteResp, false},
+		{pb.MsgStorageAppend, true},
+		{pb.MsgStorageAppendResp, true},
+		{pb.MsgStorageApply, true},
+		{pb.MsgStorageApplyResp, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprint(tt.msgt), func(t *testing.T) {
+			require.Equal(t, tt.isLocal, IsLocalMsg(tt.msgt))
+		})
+	}
+}
+
+func TestIsResponseMsg(t *testing.T) {
+	tests := []struct {
+		msgt       pb.MessageType
+		isResponse bool
+	}{
+		{pb.MsgHup, false},
+		{pb.MsgBeat, false},
+		{pb.MsgUnreachable, true},
+		{pb.MsgSnapStatus, false},
+		{pb.MsgCheckQuorum, false},
+		{pb.MsgTransferLeader, false},
+		{pb.MsgProp, false},
+		{pb.MsgApp, false},
+		{pb.MsgAppResp, true},
+		{pb.MsgVote, false},
+		{pb.MsgVoteResp, true},
+		{pb.MsgSnap, false},
+		{pb.MsgHeartbeat, false},
+		{pb.MsgHeartbeatResp, true},
+		{pb.MsgTimeoutNow, false},
+		{pb.MsgReadIndex, false},
+		{pb.MsgReadIndexResp, true},
+		{pb.MsgPreVote, false},
+		{pb.MsgPreVoteResp, true},
+		{pb.MsgStorageAppend, false},
+		{pb.MsgStorageAppendResp, true},
+		{pb.MsgStorageApply, false},
+		{pb.MsgStorageApplyResp, true},
 	}
 
 	for i, tt := range tests {
-		got := IsLocalMsg(tt.msgt)
-		if got != tt.isLocal {
-			t.Errorf("#%d: got %v, want %v", i, got, tt.isLocal)
+		got := IsResponseMsg(tt.msgt)
+		if got != tt.isResponse {
+			t.Errorf("#%d: got %v, want %v", i, got, tt.isResponse)
 		}
 	}
+}
+
+// TestPayloadSizeOfEmptyEntry ensures that payloadSize of empty entry is always zero.
+// This property is important because new leaders append an empty entry to their log,
+// and we don't want this to count towards the uncommitted log quota.
+func TestPayloadSizeOfEmptyEntry(t *testing.T) {
+	e := pb.Entry{Data: nil}
+	require.Equal(t, 0, int(payloadSize(e)))
 }

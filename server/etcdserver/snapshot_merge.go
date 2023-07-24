@@ -45,7 +45,7 @@ func (s *EtcdServer) createMergedSnapshotMessage(m raftpb.Message, snapt, snapi 
 
 	// put the []byte snapshot of store into raft snapshot and return the merged snapshot with
 	// KV readCloser snapshot.
-	snapshot := raftpb.Snapshot{
+	snapshot := &raftpb.Snapshot{
 		Metadata: raftpb.SnapshotMetadata{
 			Index:     snapi,
 			Term:      snapt,

@@ -43,7 +43,7 @@ func (env *InteractionEnv) Handle(t *testing.T, d datadriven.TestData) string {
 	case "add-nodes":
 		// Example:
 		//
-		// add-nodes <number-of-nodes-to-add> voters=(1 2 3) learners=(4 5) index=2 content=foo
+		// add-nodes <number-of-nodes-to-add> voters=(1 2 3) learners=(4 5) index=2 content=foo async-storage-writes=true
 		err = env.handleAddNodes(t, d)
 	case "campaign":
 		// Example:
@@ -67,6 +67,16 @@ func (env *InteractionEnv) Handle(t *testing.T, d datadriven.TestData) string {
 		//
 		// process-ready 3
 		err = env.handleProcessReady(t, d)
+	case "process-append-thread":
+		// Example:
+		//
+		// process-append-thread 3
+		err = env.handleProcessAppendThread(t, d)
+	case "process-apply-thread":
+		// Example:
+		//
+		// process-apply-thread 3
+		err = env.handleProcessApplyThread(t, d)
 	case "log-level":
 		// Set the log level. NONE disables all output, including from the test
 		// harness (except errors).
@@ -82,9 +92,22 @@ func (env *InteractionEnv) Handle(t *testing.T, d datadriven.TestData) string {
 		//
 		// raft-log 3
 		err = env.handleRaftLog(t, d)
+	case "raft-state":
+		// Print Raft state of all nodes (whether the node is leading,
+		// following, etc.). The information for node n is based on
+		// n's view.
+		err = env.handleRaftState()
+	case "set-randomized-election-timeout":
+		// Set the randomized election timeout for the given node. Will be reset
+		// again when the node changes state.
+		//
+		// Example:
+		//
+		// set-randomized-election-timeout 1 timeout=5
+		err = env.handleSetRandomizedElectionTimeout(t, d)
 	case "stabilize":
 		// Deliver messages to and run process-ready on the set of IDs until
-		// no more work is to be done.
+		// no more work is to be done. If no ids are given, all nodes are used.
 		//
 		// Example:
 		//
@@ -97,6 +120,14 @@ func (env *InteractionEnv) Handle(t *testing.T, d datadriven.TestData) string {
 		//
 		// status 5
 		err = env.handleStatus(t, d)
+	case "tick-election":
+		// Tick an election timeout interval for the given node (but beware the
+		// randomized timeout).
+		//
+		// Example:
+		//
+		// tick-election 3
+		err = env.handleTickElection(t, d)
 	case "tick-heartbeat":
 		// Tick a heartbeat interval.
 		//
@@ -104,6 +135,20 @@ func (env *InteractionEnv) Handle(t *testing.T, d datadriven.TestData) string {
 		//
 		// tick-heartbeat 3
 		err = env.handleTickHeartbeat(t, d)
+	case "transfer-leadership":
+		// Transfer the Raft leader.
+		//
+		// Example:
+		//
+		// transfer-leadership from=1 to=4
+		err = env.handleTransferLeadership(t, d)
+	case "forget-leader":
+		// Forgets the current leader of the given node.
+		//
+		// Example:
+		//
+		// forget-leader 1
+		err = env.handleForgetLeader(t, d)
 	case "propose":
 		// Propose an entry.
 		//
@@ -112,35 +157,49 @@ func (env *InteractionEnv) Handle(t *testing.T, d datadriven.TestData) string {
 		// propose 1 foo
 		err = env.handlePropose(t, d)
 	case "propose-conf-change":
-		// Propose a configuration change.
+		// Propose a configuration change, or transition out of a previously
+		// proposed joint configuration change that requested explicit
+		// transitions. When adding nodes, this command can be used to
+		// logically add nodes to the configuration, but add-nodes is needed
+		// to "create" the nodes.
 		//
+		// propose-conf-change node_id [v1=<bool>] [transition=<string>]
+		// command string
+		// See ConfChangesFromString for command string format.
+		// Arguments are:
+		//    node_id - the node proposing the configuration change.
+		//    v1 - make one change at a time, false by default.
+		//    transition - "auto" (the default), "explicit" or "implicit".
 		// Example:
 		//
-		// propose-conf-change transition=explicit
+		// propose-conf-change 1 transition=explicit
 		// v1 v3 l4 r5
 		//
 		// Example:
 		//
-		// propose-conf-change v1=true
+		// propose-conf-change 2 v1=true
 		// v5
 		err = env.handleProposeConfChange(t, d)
+	case "report-unreachable":
+		// Calls <1st>.ReportUnreachable(<2nd>).
+		//
+		// Example:
+		// report-unreachable 1 2
+		err = env.handleReportUnreachable(t, d)
 	default:
 		err = fmt.Errorf("unknown command")
-	}
-	if err != nil {
-		env.Output.WriteString(err.Error())
 	}
 	// NB: the highest log level suppresses all output, including that of the
 	// handlers. This comes in useful during setup which can be chatty.
 	// However, errors are always logged.
-	if env.Output.Len() == 0 {
-		return "ok"
-	}
-	if env.Output.Lvl == len(lvlNames)-1 {
-		if err != nil {
+	if err != nil {
+		if env.Output.Quiet() {
 			return err.Error()
 		}
-		return "ok (quiet)"
+		env.Output.WriteString(err.Error())
+	}
+	if env.Output.Len() == 0 {
+		return "ok"
 	}
 	return env.Output.String()
 }

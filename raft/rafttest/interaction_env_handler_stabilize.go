@@ -19,42 +19,90 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/datadriven"
+
+	"go.etcd.io/etcd/raft/v3"
 	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 func (env *InteractionEnv) handleStabilize(t *testing.T, d datadriven.TestData) error {
-	idxs := nodeIdxs(t, d)
+	idxs := nodeIdxs(t, d) // skips key=value args
+	for _, arg := range d.CmdArgs {
+		for i := range arg.Vals {
+			switch arg.Key {
+			case "log-level":
+				defer func(old int) {
+					env.Output.Lvl = old
+				}(env.Output.Lvl)
+				var level string
+				arg.Scan(t, i, &level)
+				if err := env.LogLevel(level); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	return env.Stabilize(idxs...)
 }
 
 // Stabilize repeatedly runs Ready handling on and message delivery to the set
 // of nodes specified via the idxs slice until reaching a fixed point.
 func (env *InteractionEnv) Stabilize(idxs ...int) error {
-	var nodes []Node
-	for _, idx := range idxs {
-		nodes = append(nodes, env.Nodes[idx])
-	}
-	if len(nodes) == 0 {
-		nodes = env.Nodes
+	var nodes []*Node
+	if len(idxs) != 0 {
+		for _, idx := range idxs {
+			nodes = append(nodes, &env.Nodes[idx])
+		}
+	} else {
+		for i := range env.Nodes {
+			nodes = append(nodes, &env.Nodes[i])
+		}
 	}
 
 	for {
 		done := true
 		for _, rn := range nodes {
 			if rn.HasReady() {
-				done = false
 				idx := int(rn.Status().ID - 1)
 				fmt.Fprintf(env.Output, "> %d handling Ready\n", idx+1)
-				env.withIndent(func() { env.ProcessReady(idx) })
+				var err error
+				env.withIndent(func() { err = env.ProcessReady(idx) })
+				if err != nil {
+					return err
+				}
+				done = false
 			}
 		}
 		for _, rn := range nodes {
 			id := rn.Status().ID
 			// NB: we grab the messages just to see whether to print the header.
 			// DeliverMsgs will do it again.
-			if msgs, _ := splitMsgs(env.Messages, id); len(msgs) > 0 {
+			if msgs, _ := splitMsgs(env.Messages, id, false /* drop */); len(msgs) > 0 {
 				fmt.Fprintf(env.Output, "> %d receiving messages\n", id)
 				env.withIndent(func() { env.DeliverMsgs(Recipient{ID: id}) })
+				done = false
+			}
+		}
+		for _, rn := range nodes {
+			idx := int(rn.Status().ID - 1)
+			if len(rn.AppendWork) > 0 {
+				fmt.Fprintf(env.Output, "> %d processing append thread\n", idx+1)
+				for len(rn.AppendWork) > 0 {
+					var err error
+					env.withIndent(func() { err = env.ProcessAppendThread(idx) })
+					if err != nil {
+						return err
+					}
+				}
+				done = false
+			}
+		}
+		for _, rn := range nodes {
+			idx := int(rn.Status().ID - 1)
+			if len(rn.ApplyWork) > 0 {
+				fmt.Fprintf(env.Output, "> %d processing apply thread\n", idx+1)
+				for len(rn.ApplyWork) > 0 {
+					env.withIndent(func() { env.ProcessApplyThread(idx) })
+				}
 				done = false
 			}
 		}
@@ -64,14 +112,19 @@ func (env *InteractionEnv) Stabilize(idxs ...int) error {
 	}
 }
 
-func splitMsgs(msgs []raftpb.Message, to uint64) (toMsgs []raftpb.Message, rmdr []raftpb.Message) {
+func splitMsgs(msgs []raftpb.Message, to uint64, drop bool) (toMsgs []raftpb.Message, rmdr []raftpb.Message) {
 	// NB: this method does not reorder messages.
 	for _, msg := range msgs {
-		if msg.To == to {
+		if msg.To == to && !(drop && isLocalMsg(msg)) {
 			toMsgs = append(toMsgs, msg)
 		} else {
 			rmdr = append(rmdr, msg)
 		}
 	}
 	return toMsgs, rmdr
+}
+
+// Don't drop local messages, which require reliable delivery.
+func isLocalMsg(msg raftpb.Message) bool {
+	return msg.From == msg.To || raft.IsLocalMsgTarget(msg.From) || raft.IsLocalMsgTarget(msg.To)
 }

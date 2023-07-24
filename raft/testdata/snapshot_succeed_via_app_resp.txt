@@ -23,16 +23,16 @@ ok
 # Fully replicate everything, including the leader's empty index.
 stabilize
 ----
-ok (quiet)
+ok
 
 compact 1 11
 ----
-ok (quiet)
+ok
 
 # Drop inflight messages to n3.
 deliver-msgs drop=(3)
 ----
-ok (quiet)
+ok
 
 # Show the Raft log messages from now on.
 log-level debug
@@ -41,7 +41,7 @@ ok
 
 status 1
 ----
-1: StateReplicate match=11 next=12 inactive
+1: StateReplicate match=11 next=12
 2: StateReplicate match=11 next=12
 3: StateProbe match=0 next=11 paused inactive
 
@@ -95,7 +95,7 @@ stabilize 1
 
 status 1
 ----
-1: StateReplicate match=11 next=12 inactive
+1: StateReplicate match=11 next=12
 2: StateReplicate match=11 next=12
 3: StateSnapshot match=0 next=11 paused pendingSnap=11
 
@@ -107,7 +107,7 @@ stabilize 3
 ----
 > 3 receiving messages
   1->3 MsgSnap Term:1 Log:0/0 Snapshot: Index:11 Term:1 ConfState:Voters:[1 2 3] VotersOutgoing:[] Learners:[] LearnersNext:[] AutoLeave:false
-  INFO log [committed=0, applied=0, unstable.offset=1, len(unstable.Entries)=0] starts to restore snapshot [index: 11, term: 1]
+  INFO log [committed=0, applied=0, applying=0, unstable.offset=1, unstable.offsetInProgress=1, len(unstable.Entries)=0] starts to restore snapshot [index: 11, term: 1]
   INFO 3 switched to configuration voters=(1 2 3)
   INFO 3 [commit: 11, lastindex: 11, lastterm: 1] restored snapshot [index: 11, term: 1]
   INFO 3 [commit: 11] restored snapshot [index: 11, term: 1]
@@ -132,7 +132,7 @@ stabilize 1
 
 status 1
 ----
-1: StateReplicate match=11 next=12 inactive
+1: StateReplicate match=11 next=12
 2: StateReplicate match=11 next=12
 3: StateReplicate match=11 next=12
 

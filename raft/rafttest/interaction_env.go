@@ -27,6 +27,10 @@ import (
 // InteractionOpts groups the options for an InteractionEnv.
 type InteractionOpts struct {
 	OnConfig func(*raft.Config)
+
+	// SetRandomizedElectionTimeout is used to plumb this function down from the
+	// raft test package.
+	SetRandomizedElectionTimeout func(node *raft.RawNode, timeout int)
 }
 
 // Node is a member of a raft group tested via an InteractionEnv.
@@ -34,8 +38,10 @@ type Node struct {
 	*raft.RawNode
 	Storage
 
-	Config  *raft.Config
-	History []pb.Snapshot
+	Config     *raft.Config
+	AppendWork []pb.Message // []MsgStorageAppend
+	ApplyWork  []pb.Message // []MsgStorageApply
+	History    []pb.Snapshot
 }
 
 // InteractionEnv facilitates testing of complex interactions between the
@@ -84,15 +90,13 @@ type Storage interface {
 	Append([]pb.Entry) error
 }
 
-// defaultRaftConfig sets up a *raft.Config with reasonable testing defaults.
-// In particular, no limits are set.
-func defaultRaftConfig(id uint64, applied uint64, s raft.Storage) *raft.Config {
-	return &raft.Config{
-		ID:              id,
-		Applied:         applied,
+// raftConfigStub sets up a raft.Config stub with reasonable testing defaults.
+// In particular, no limits are set. It is not a complete config: ID and Storage
+// must be set for each node using the stub as a template.
+func raftConfigStub() raft.Config {
+	return raft.Config{
 		ElectionTick:    3,
 		HeartbeatTick:   1,
-		Storage:         s,
 		MaxSizePerMsg:   math.MaxUint64,
 		MaxInflightMsgs: math.MaxInt32,
 	}

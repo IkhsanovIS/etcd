@@ -89,7 +89,7 @@ func TestConfChangeQuick(t *testing.T) {
 
 	wrapper := func(invoke testFunc) func(setup initialChanges, ccs confChanges) (*Changer, error) {
 		return func(setup initialChanges, ccs confChanges) (*Changer, error) {
-			tr := tracker.MakeProgressTracker(10)
+			tr := tracker.MakeProgressTracker(10, 0)
 			c := &Changer{
 				Tracker:   tr,
 				LastIndex: 10,
@@ -138,12 +138,6 @@ func TestConfChangeQuick(t *testing.T) {
 	t.Error("setup:", Describe(cErr.In[0].([]pb.ConfChangeSingle)...))
 	t.Error("ccs:", Describe(cErr.In[1].([]pb.ConfChangeSingle)...))
 	t.Errorf("out1: %+v\nout2: %+v", cErr.Out1, cErr.Out2)
-}
-
-type confChangeTyp pb.ConfChangeType
-
-func (confChangeTyp) Generate(rand *rand.Rand, _ int) reflect.Value {
-	return reflect.ValueOf(confChangeTyp(rand.Intn(4)))
 }
 
 type confChanges []pb.ConfChangeSingle

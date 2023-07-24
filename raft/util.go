@@ -40,13 +40,44 @@ func max(a, b uint64) uint64 {
 	return b
 }
 
+var isLocalMsg = [...]bool{
+	pb.MsgHup:               true,
+	pb.MsgBeat:              true,
+	pb.MsgUnreachable:       true,
+	pb.MsgSnapStatus:        true,
+	pb.MsgCheckQuorum:       true,
+	pb.MsgStorageAppend:     true,
+	pb.MsgStorageAppendResp: true,
+	pb.MsgStorageApply:      true,
+	pb.MsgStorageApplyResp:  true,
+}
+
+var isResponseMsg = [...]bool{
+	pb.MsgAppResp:           true,
+	pb.MsgVoteResp:          true,
+	pb.MsgHeartbeatResp:     true,
+	pb.MsgUnreachable:       true,
+	pb.MsgReadIndexResp:     true,
+	pb.MsgPreVoteResp:       true,
+	pb.MsgStorageAppendResp: true,
+	pb.MsgStorageApplyResp:  true,
+}
+
+func isMsgInArray(msgt pb.MessageType, arr []bool) bool {
+	i := int(msgt)
+	return i < len(arr) && arr[i]
+}
+
 func IsLocalMsg(msgt pb.MessageType) bool {
-	return msgt == pb.MsgHup || msgt == pb.MsgBeat || msgt == pb.MsgUnreachable ||
-		msgt == pb.MsgSnapStatus || msgt == pb.MsgCheckQuorum
+	return isMsgInArray(msgt, isLocalMsg[:])
 }
 
 func IsResponseMsg(msgt pb.MessageType) bool {
-	return msgt == pb.MsgAppResp || msgt == pb.MsgVoteResp || msgt == pb.MsgHeartbeatResp || msgt == pb.MsgUnreachable || msgt == pb.MsgPreVoteResp
+	return isMsgInArray(msgt, isResponseMsg[:])
+}
+
+func IsLocalMsgTarget(id uint64) bool {
+	return id == LocalAppendThread || id == LocalApplyThread
 }
 
 // voteResponseType maps vote and prevote message types to their corresponding responses.
@@ -132,33 +163,54 @@ type EntryFormatter func([]byte) string
 // Message for debugging.
 func DescribeMessage(m pb.Message, f EntryFormatter) string {
 	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "%x->%x %v Term:%d Log:%d/%d", m.From, m.To, m.Type, m.Term, m.LogTerm, m.Index)
+	fmt.Fprintf(&buf, "%s->%s %v Term:%d Log:%d/%d",
+		describeTarget(m.From), describeTarget(m.To), m.Type, m.Term, m.LogTerm, m.Index)
 	if m.Reject {
 		fmt.Fprintf(&buf, " Rejected (Hint: %d)", m.RejectHint)
 	}
 	if m.Commit != 0 {
 		fmt.Fprintf(&buf, " Commit:%d", m.Commit)
 	}
+	if m.Vote != 0 {
+		fmt.Fprintf(&buf, " Vote:%d", m.Vote)
+	}
 	if len(m.Entries) > 0 {
-		fmt.Fprintf(&buf, " Entries:[")
+		fmt.Fprint(&buf, " Entries:[")
 		for i, e := range m.Entries {
 			if i != 0 {
 				buf.WriteString(", ")
 			}
 			buf.WriteString(DescribeEntry(e, f))
 		}
-		fmt.Fprintf(&buf, "]")
+		fmt.Fprint(&buf, "]")
 	}
-	if !IsEmptySnap(m.Snapshot) {
-		fmt.Fprintf(&buf, " Snapshot: %s", DescribeSnapshot(m.Snapshot))
+	if s := m.Snapshot; s != nil && !IsEmptySnap(*s) {
+		fmt.Fprintf(&buf, " Snapshot: %s", DescribeSnapshot(*s))
+	}
+	if len(m.Responses) > 0 {
+		fmt.Fprintf(&buf, " Responses:[")
+		for i, m := range m.Responses {
+			if i != 0 {
+				buf.WriteString(", ")
+			}
+			buf.WriteString(DescribeMessage(m, f))
+		}
+		fmt.Fprintf(&buf, "]")
 	}
 	return buf.String()
 }
 
-// PayloadSize is the size of the payload of this Entry. Notably, it does not
-// depend on its Index or Term.
-func PayloadSize(e pb.Entry) int {
-	return len(e.Data)
+func describeTarget(id uint64) string {
+	switch id {
+	case None:
+		return "None"
+	case LocalAppendThread:
+		return "AppendThread"
+	case LocalApplyThread:
+		return "ApplyThread"
+	default:
+		return fmt.Sprintf("%x", id)
+	}
 }
 
 // DescribeEntry returns a concise human-readable description of an
@@ -209,19 +261,54 @@ func DescribeEntries(ents []pb.Entry, f EntryFormatter) string {
 	return buf.String()
 }
 
-func limitSize(ents []pb.Entry, maxSize uint64) []pb.Entry {
+// entryEncodingSize represents the protocol buffer encoding size of one or more
+// entries.
+type entryEncodingSize uint64
+
+func entsSize(ents []pb.Entry) entryEncodingSize {
+	var size entryEncodingSize
+	for _, ent := range ents {
+		size += entryEncodingSize(ent.Size())
+	}
+	return size
+}
+
+// limitSize returns the longest prefix of the given entries slice, such that
+// its total byte size does not exceed maxSize. Always returns a non-empty slice
+// if the input is non-empty, so, as an exception, if the size of the first
+// entry exceeds maxSize, a non-empty slice with just this entry is returned.
+func limitSize(ents []pb.Entry, maxSize entryEncodingSize) []pb.Entry {
 	if len(ents) == 0 {
 		return ents
 	}
 	size := ents[0].Size()
-	var limit int
-	for limit = 1; limit < len(ents); limit++ {
+	for limit := 1; limit < len(ents); limit++ {
 		size += ents[limit].Size()
-		if uint64(size) > maxSize {
-			break
+		if entryEncodingSize(size) > maxSize {
+			return ents[:limit]
 		}
 	}
-	return ents[:limit]
+	return ents
+}
+
+// entryPayloadSize represents the size of one or more entries' payloads.
+// Notably, it does not depend on its Index or Term. Entries with empty
+// payloads, like those proposed after a leadership change, are considered
+// to be zero size.
+type entryPayloadSize uint64
+
+// payloadSize is the size of the payload of the provided entry.
+func payloadSize(e pb.Entry) entryPayloadSize {
+	return entryPayloadSize(len(e.Data))
+}
+
+// payloadsSize is the size of the payloads of the provided entries.
+func payloadsSize(ents []pb.Entry) entryPayloadSize {
+	var s entryPayloadSize
+	for _, e := range ents {
+		s += payloadSize(e)
+	}
+	return s
 }
 
 func assertConfStatesEquivalent(l Logger, cs1, cs2 pb.ConfState) {
@@ -230,4 +317,21 @@ func assertConfStatesEquivalent(l Logger, cs1, cs2 pb.ConfState) {
 		return
 	}
 	l.Panic(err)
+}
+
+// extend appends vals to the given dst slice. It differs from the standard
+// slice append only in the way it allocates memory. If cap(dst) is not enough
+// for appending the values, precisely size len(dst)+len(vals) is allocated.
+//
+// Use this instead of standard append in situations when this is the last
+// append to dst, so there is no sense in allocating more than needed.
+func extend(dst, vals []pb.Entry) []pb.Entry {
+	need := len(dst) + len(vals)
+	if need <= cap(dst) {
+		return append(dst, vals...) // does not allocate
+	}
+	buf := make([]pb.Entry, need, need) // allocates precisely what's needed
+	copy(buf, dst)
+	copy(buf[len(dst):], vals)
+	return buf
 }
