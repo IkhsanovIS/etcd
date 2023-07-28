@@ -1,4 +1,4 @@
-module go.etcd.io/etcd/tests/v3
+module github.com/IkhsanovIS/etcd/tests/v3
 
 go 1.19
 
