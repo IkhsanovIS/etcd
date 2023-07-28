@@ -1,4 +1,4 @@
-module go.etcd.io/etcd/client/v2
+module github.com/IkhsanovIS/etcd/client/v2
 
 go 1.19
 

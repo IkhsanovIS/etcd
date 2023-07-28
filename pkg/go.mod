@@ -1,4 +1,4 @@
-module go.etcd.io/etcd/pkg/v3
+module github.com/IkhsanovIS/etcd/pkg/v3
 
 go 1.19
 

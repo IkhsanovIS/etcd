@@ -1,4 +1,4 @@
-module go.etcd.io/etcd/server/v3
+module github.com/IkhsanovIS/etcd/server/v3
 
 go 1.19
 

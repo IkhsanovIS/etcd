@@ -1,4 +1,4 @@
-module go.etcd.io/etcd/etcdutl/v3
+module github.com/IkhsanovIS/etcd/etcdutl/v3
 
 go 1.19
 
