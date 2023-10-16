@@ -2,6 +2,10 @@ module github.com/IkhsanovIS/etcd/raft/v3
 
 go 1.19
 
+replace (
+	go.etcd.io/etcd/raft/v3/raftpb => ./raftpb
+)
+
 require (
 	github.com/cockroachdb/datadriven v1.0.2
 	github.com/gogo/protobuf v1.3.2
